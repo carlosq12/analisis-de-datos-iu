@@ -177,6 +177,17 @@ const SOURCES: Record<string, GrammarSource> = {
       'Likely cause: no prebuilt `.node` for this platform/architecture. ' +
       `See ${ISSUES_URL}/2107.`,
   },
+  [SupportedLanguages.Lua]: {
+    load: () => requireVendoredGrammar('tree-sitter-lua'),
+    optional: true,
+    userSkippable: true,
+    unavailableNote:
+      'Lua parsing disabled: vendored `tree-sitter-lua` (under ' +
+      '`gitnexus/vendor/tree-sitter-lua`) failed to load. ' +
+      'Likely cause: the native binding did not build at install (missing ' +
+      'python3/make/clang) or no prebuilt `.node` for this platform/architecture. ' +
+      `See ${ISSUES_URL}.`,
+  },
 };
 
 /**

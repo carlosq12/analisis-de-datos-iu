@@ -2447,6 +2447,67 @@ export const DART_QUERIES = `
   right: (_)) @assignment
 `;
 
+// Lua queries — works with vendored tree-sitter-lua (rebuilt against the
+// tree-sitter@0.21.1 runtime + Napi convention; see vendor/tree-sitter-lua).
+// AST node names verified by parsing a sample with the smoke test in
+// ~/gitnexus-lua-work/abi-test/smoke2.cjs.
+//
+// Phase A (legacy DAG): definition NODES + call SITES. NOTE: CALLS and
+// IMPORTS EDGES are NOT emitted by the legacy path — call/import resolution
+// was migrated to the scope-resolution pipeline (RFC #909, gated on
+// emitScopeCaptures; see call-processor.ts:4-7 + parse-worker.ts:1654). The
+// @call captures here produce call sites in parse-worker, but those sites
+// only become CALLS edges once lua's scope query (lua/query.ts) + the
+// emitScopeCaptures hooks land (Phase B). The definition captures DO produce
+// Function/Method nodes regardless.
+export const LUA_QUERIES = `
+; ── Functions: function foo() ... end (name is a bare identifier) ────────────
+(function_definition_statement
+  name: (identifier) @name) @definition.function
+
+; ── Methods: function Obj:method() (name is a variable: table + method) ──────
+(function_definition_statement
+  name: (variable
+    method: (identifier) @name)) @definition.method
+
+; ── Dot-methods: function Obj.method() (name is a variable: table + field) ───
+(function_definition_statement
+  name: (variable
+    field: (identifier) @name)) @definition.method
+
+; ── Local functions: local function foo() ... end ─────────────────────────────
+(local_function_definition_statement
+  name: (identifier) @name) @definition.function
+
+; ── middleclass classes: local Foo = class("Foo"[, Parent]) ─────────────────────
+;   class() is a plain call; the Class node's name comes from the local var
+;   (quote-free). EXTENDS (Parent arg) + HAS_METHOD (function Foo:method() → Foo)
+;   need scope-resolution receiver modeling and the heritage marker; middleclass
+;   methods are file-top-level (not class-body nested), so the class is not a
+;   lexical scope — deferred (Phase B2b/B3).
+(local_variable_declaration
+  (variable_list (variable name: (identifier) @name))
+  (expression_list
+    value: (call
+      function: (variable name: (identifier) @_class)
+      (#eq? @_class "class")))) @definition.class
+
+; ── Calls: foo(), obj:bar(), obj.baz() ────────────────────────────────────────
+;   call.function is a (variable); @call.name lands on the invoked identifier
+;   so the generic call extractor can derive calledName + callForm + receiver.
+(call
+  function: (variable
+    name: (identifier) @call.name)) @call
+
+(call
+  function: (variable
+    method: (identifier) @call.name)) @call
+
+(call
+  function: (variable
+    field: (identifier) @call.name)) @call
+`;
+
 import { SupportedLanguages } from 'gitnexus-shared';
 
 export const LANGUAGE_QUERIES: Record<SupportedLanguages, string> = {
@@ -2464,6 +2525,7 @@ export const LANGUAGE_QUERIES: Record<SupportedLanguages, string> = {
   [SupportedLanguages.Ruby]: RUBY_QUERIES,
   [SupportedLanguages.Swift]: SWIFT_QUERIES,
   [SupportedLanguages.Dart]: DART_QUERIES,
+  [SupportedLanguages.Lua]: LUA_QUERIES,
   [SupportedLanguages.Vue]: TYPESCRIPT_QUERIES, // Vue <script> blocks are parsed as TypeScript
   [SupportedLanguages.Cobol]: '', // Standalone regex processor — no tree-sitter queries
 };
