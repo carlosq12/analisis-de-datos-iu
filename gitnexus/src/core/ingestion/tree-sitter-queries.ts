@@ -2449,8 +2449,7 @@ export const DART_QUERIES = `
 
 // Lua queries — works with vendored tree-sitter-lua (rebuilt against the
 // tree-sitter@0.21.1 runtime + Napi convention; see vendor/tree-sitter-lua).
-// AST node names verified by parsing a sample with the smoke test in
-// ~/gitnexus-lua-work/abi-test/smoke2.cjs.
+// AST node names verified by the parser-loader-abi smoke test.
 //
 // Phase A (legacy DAG): definition NODES + call SITES. NOTE: CALLS and
 // IMPORTS EDGES are NOT emitted by the legacy path — call/import resolution
