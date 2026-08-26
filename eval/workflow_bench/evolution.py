@@ -536,6 +536,20 @@ def evaluate_candidate(
             if (not metric_unavailable and incumbent_metric)
             else None
         )
+        # A task that both arms measured cleanly and neither ever resolved sits
+        # outside both arms' current capability. It carries no quality signal
+        # about the candidate, and its metric compares who spent more while
+        # failing the same oracle — so gating on it measures the task, not the
+        # candidate, and one such task vetoes every future promotion for as
+        # long as it stays in the set. Keep it in the evidence, out of the gate,
+        # and name it as task health instead.
+        fully_measured = (
+            incumbent_runs >= min_runs
+            and candidate_runs >= min_runs
+            and not incumbent_excluded
+            and not candidate_excluded
+        )
+        gated = not (fully_measured and not incumbent["resolved"] and not candidate["resolved"])
         task_rows.append(
             {
                 "task": task_id,
@@ -548,8 +562,11 @@ def evaluate_candidate(
                 "incumbent_metric": incumbent_metric,
                 "candidate_metric": candidate_metric,
                 "improvement_pct": improvement,
+                "gated": gated,
             }
         )
+        if not gated:
+            continue
 
         if incumbent_runs < min_runs or candidate_runs < min_runs:
             insufficient = True
@@ -592,11 +609,24 @@ def evaluate_candidate(
                 f"{task_id}: {metric} regressed {-improvement:.1f}%, above the {max_task_regression_pct:.1f}% task cap"
             )
 
+    ungated_tasks = [row["task"] for row in task_rows if not row["gated"]]
+    if ungated_tasks:
+        # One line, not one per task: `reasons` is truncated to three entries
+        # when it is fed back to the proposer (evolve.summarize_gate), and a
+        # growing set of unsolvable tasks must not crowd out the reason the
+        # candidate actually won or lost. The full list ships structurally.
+        reasons.append(f"not gated on {len(ungated_tasks)} task(s) neither arm resolved: {', '.join(ungated_tasks)}")
     if not task_rows:
         insufficient = True
         reasons.append("no paired task results were found")
+    elif len(ungated_tasks) == len(task_rows):
+        # Every paired task was ungated, so nothing in this generation says
+        # anything about candidate quality. Refuse rather than fall through to
+        # an efficiency-only verdict on runs that all failed their oracle.
+        insufficient = True
+        reasons.append("no task supplied quality signal: neither arm resolved a run anywhere in the set")
 
-    improvements = [row["improvement_pct"] for row in task_rows if row["improvement_pct"] is not None]
+    improvements = [row["improvement_pct"] for row in task_rows if row["gated"] and row["improvement_pct"] is not None]
     median_improvement = round(statistics.median(improvements), 1) if improvements else None
     incumbent_resolved = sum(
         arms[incumbent_arm]["resolved"] for arms in results.values() if incumbent_arm in arms and candidate_arm in arms
@@ -640,6 +670,7 @@ def evaluate_candidate(
         "metric": metric,
         "metric_warning": (MAIN_LOOP_ONLY_WARNING if metric in MAIN_LOOP_ONLY_METRICS else None),
         "median_improvement_pct": median_improvement,
+        "ungated_tasks": ungated_tasks,
         "reasons": reasons,
         "tasks": task_rows,
     }

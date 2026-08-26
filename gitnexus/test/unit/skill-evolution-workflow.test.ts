@@ -18,10 +18,14 @@ const workflowDocument = load(workflow) as {
     string,
     {
       environment?: unknown;
+      env?: Record<string, string>;
+      'timeout-minutes'?: unknown;
       steps?: Array<{
         name?: string;
+        if?: unknown;
         run?: unknown;
         uses?: string;
+        'timeout-minutes'?: unknown;
         with?: Record<string, unknown>;
       }>;
     }
@@ -30,8 +34,14 @@ const workflowDocument = load(workflow) as {
 
 const evolveJob = workflowDocument.jobs?.evolve;
 
+type WorkflowStep = NonNullable<NonNullable<typeof evolveJob>['steps']>[number];
+
+function findStep(stepName: string): WorkflowStep | undefined {
+  return evolveJob?.steps?.find(({ name }) => name === stepName);
+}
+
 function stepRun(stepName: string): string {
-  const step = evolveJob?.steps?.find(({ name }) => name === stepName);
+  const step = findStep(stepName);
   return typeof step?.run === 'string' ? step.run : '';
 }
 
@@ -42,6 +52,14 @@ describe('gitnexus skill-evolution workflow contract', () => {
     // Without --apply the overlay is never written, git status stays clean,
     // promoted=false is emitted, and the App-token/PR steps are dead code.
     expect(loop).toContain('--apply');
+  });
+
+  it('passes the cell concurrency through to the benchmark', () => {
+    // The lane is serial unless told otherwise: concurrency only pays off when
+    // the runner has the vCPUs for it, and a cell starved of CPU drifts toward
+    // its session timeout, which the gate counts as an excluded run.
+    expect(stepRun('Run the propose → benchmark → gate loop')).toContain('--workers "${WORKERS}"');
+    expect(evolveJob?.env?.WORKERS).toBe("${{ inputs.workers || '1' }}");
   });
 
   it('runs the proposer on its own model, separate from the benchmark arms', () => {
@@ -63,9 +81,7 @@ describe('gitnexus skill-evolution workflow contract', () => {
     // The benchmark sandbox-copies node_modules from all three (tasks.scenarios.yaml).
     // The root tree was absent on the first real run because only the two subpackage
     // steps ran, so capture_task_dependency_binding aborted at task binding.
-    const rootStep = evolveJob?.steps?.find(
-      ({ name }) => name === 'Install monorepo root dependencies',
-    );
+    const rootStep = findStep('Install monorepo root dependencies');
     expect(rootStep).toBeDefined();
     expect(rootStep).not.toHaveProperty('working-directory'); // installs at the repo root
     expect(String(rootStep?.run)).toContain('npm ci');
@@ -92,7 +108,7 @@ describe('gitnexus skill-evolution workflow contract', () => {
 
   it('least-privileges the App token and gates the job on a protected Environment', () => {
     expect(evolveJob?.environment).toBe('gitnexus-evolution');
-    const mint = evolveJob?.steps?.find(({ name }) => name === 'Mint GitHub App token');
+    const mint = findStep('Mint GitHub App token');
     expect(mint?.with).toMatchObject({
       'client-id': expect.any(String),
       'permission-contents': 'write',
@@ -117,6 +133,33 @@ describe('gitnexus skill-evolution workflow contract', () => {
     for (const step of runSteps) {
       expect(step.run, `${step.name} must set -euo pipefail`).toContain('set -euo pipefail');
     }
+  });
+
+  it('kills the benchmark with job time left to upload its evidence', () => {
+    // A job-level timeout cancels the job outright, so the upload step never
+    // runs and a multi-hour generation's evidence is lost. The sweep therefore
+    // needs its own, strictly shorter budget: a step timeout only fails that
+    // step, and the always() upload below still ships what it wrote.
+    const jobBudget = evolveJob?.['timeout-minutes'];
+    const loopStep = findStep('Run the propose → benchmark → gate loop');
+    const stepBudget = loopStep?.['timeout-minutes'];
+    expect(typeof jobBudget).toBe('number');
+    expect(typeof stepBudget).toBe('number');
+    expect(stepBudget as number).toBeLessThan(jobBudget as number);
+    // The runner is an EC2 box an EventBridge schedule stops 24h after it
+    // starts; when the box goes the runner vanishes mid-step and nothing
+    // uploads. The job must finish inside that window even when the schedule
+    // fires late (the 2026-08-01 run was queued 65 minutes after the cron).
+    expect(jobBudget as number).toBeLessThanOrEqual(21 * 60);
+  });
+
+  it('uploads benchmark evidence unconditionally, on a path it addresses itself', () => {
+    const upload = findStep('Upload benchmark evidence');
+    // The sweep appends results.jsonl and transcripts as it goes, so a killed
+    // generation still holds the evidence explaining why — and a path taken
+    // from the killed step's outputs is exactly what would not be there.
+    expect(upload?.if).toBe('always()');
+    expect(upload?.with?.path).toBe('${{ runner.temp }}/wfevolve');
   });
 
   it('documents the App secrets and protected Environment on the activation checklist', () => {

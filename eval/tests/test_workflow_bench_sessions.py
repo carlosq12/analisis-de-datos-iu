@@ -355,7 +355,7 @@ def test_mcp_config_uses_only_the_minimal_pinned_harness_runtime(monkeypatch, tm
         directory.mkdir(parents=True)
     (runtime / "dist" / "cli" / "index.js").write_text("")
     (runtime / "hooks" / "claude" / "resolve-analyze-cmd.cjs").write_text("")
-    (runtime / "package.json").write_text(json.dumps({"version": runner.PINNED_GITNEXUS_VERSION}))
+    (runtime / "package.json").write_text(json.dumps({"version": "9.9.9-test"}))
     (runtime / "node_modules" / "gitnexus-shared").symlink_to(shared, target_is_directory=True)
     (shared / "package.json").write_text(json.dumps({"name": "gitnexus-shared"}))
     monkeypatch.setattr(runtime_mounts, "HARNESS_ROOT", tmp_path)
@@ -379,9 +379,6 @@ def test_mcp_config_uses_only_the_minimal_pinned_harness_runtime(monkeypatch, tm
         (shared / "package.json", f"{runner.SANDBOX_GITNEXUS_SHARED}/package.json"),
         (runtime / "hooks" / "claude", f"{runner.SANDBOX_GITNEXUS}/hooks/claude"),
     ]
-    package = json.loads((runtime / "package.json").read_text())
-    assert package["version"] == runner.PINNED_GITNEXUS_VERSION
-
     mounted_sources = {mount.source for mount in mounts}
     mounted_targets = {mount.target for mount in mounts}
     assert runtime not in mounted_sources
@@ -458,7 +455,11 @@ def test_real_bubblewrap_runtime_mount_imports_cli_without_exposing_checkout(tmp
     assert visibility.ok, visibility.stderr_tail
     assert imported.ok, imported.stderr_tail
     assert analyze_imported.ok, analyze_imported.stderr_tail
-    assert imported.stdout_tail.strip() == runner.PINNED_GITNEXUS_VERSION
+    # The runtime the sandbox sees must be the one this checkout built —
+    # compared against the checkout itself rather than a constant, so a release
+    # bump cannot fail a benchmark that is running exactly what it should.
+    built = json.loads((runtime_mounts.HARNESS_ROOT / "gitnexus" / "package.json").read_text())
+    assert imported.stdout_tail.strip() == built["version"]
 
 
 def test_isolated_mcp_registry_contains_only_the_sandbox_clone(tmp_path):
@@ -965,6 +966,35 @@ def test_final_result_event_must_be_last(monkeypatch, tmp_path):
     assert rec["ok"] is False
     assert rec["error_kind"] == "session-error"
     assert "not the last event" in rec["error_detail"]["event_stream_error"]
+
+
+def test_background_task_teardown_after_the_result_stays_valid_evidence(monkeypatch, tmp_path):
+    # Claude Code drains background-task bookkeeping after the final result
+    # event. Those `system` events carry no tool or usage payload, so they must
+    # not invalidate an otherwise complete session (run 29907431284 lost three
+    # runs this way, and the gate demands zero excluded runs).
+    teardown = [
+        {"type": "system", "subtype": "background_tasks_changed", "tasks": []},
+        {"type": "system", "subtype": "task_updated", "task_id": "bdw43oy7j", "patch": {"status": "killed"}},
+        {"type": "system", "subtype": "task_notification", "task_id": "bdw43oy7j", "status": "stopped"},
+    ]
+    stream = event_stream(*skill_events({"skill": "gitnexus-work"})) + "".join(
+        json.dumps(event) + "\n" for event in teardown
+    )
+    monkeypatch.setattr(runner_sessions, "run_managed", lambda *a, **k: fake_cli_result(stream))
+    rec = runner.run_claude(
+        "task",
+        tmp_path,
+        claude_bin="claude",
+        timeout=5,
+        expected_skill="gitnexus-work",
+    )
+
+    assert rec["ok"] is True
+    assert rec["error_kind"] is None
+    assert rec["skill_invoked"] is True
+    assert rec["transcript_missing"] is False
+    assert "evidence_diagnostics" not in rec
 
 
 def test_snapshot_plan_docs_detects_one_modified_plan_and_rejects_ambiguous_output(tmp_path):

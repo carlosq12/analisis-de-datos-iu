@@ -620,6 +620,8 @@ def runner_argv(
         str(args.tasks),
         "--runs",
         str(args.runs),
+        "--workers",
+        str(args.workers),
         "--model",
         args.model,
         "--claude-bin",
@@ -663,6 +665,10 @@ def runner_environment(args: argparse.Namespace) -> dict[str, str]:
         "LANG": "C.UTF-8",
         "LC_ALL": "C.UTF-8",
         "GIT_TERMINAL_PROMPT": "0",
+        # The sweep writes to a pipe, so CPython would block-buffer its
+        # progress lines for hours. Unbuffered is what makes echo_stdout
+        # actually show progress rather than a burst at the end.
+        "PYTHONUNBUFFERED": "1",
     }
     if args.auth_token:
         env["GITNEXUS_BENCH_AUTH_TOKEN"] = args.auth_token
@@ -682,7 +688,7 @@ def validate_promotion_for_apply(
     now: datetime | None = None,
 ) -> list[dict[str, Any]]:
     """Require one complete, current, exact evidence binding before apply."""
-    if promotion.get("schema_version") != 3:
+    if promotion.get("schema_version") != 4:
         raise ValueError("promotion binding uses an unsupported schema")
     sha256_pattern = re.compile(r"[0-9a-f]{64}")
     if not selected_tasks:
@@ -788,6 +794,13 @@ def build_parser() -> argparse.ArgumentParser:
         "quality matters more than cost here, so a stronger model is fine",
     )
     parser.add_argument("--runs", type=int, default=3, help="per arm per task; the gate needs ≥3")
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=1,
+        help="benchmark cells of one task to run at once (default 1, fully "
+        "serial); size it to the machine — see workflow_bench.runner --workers",
+    )
     parser.add_argument("--generations", type=int, default=1)
     parser.add_argument(
         "--arms",
@@ -822,7 +835,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--out-root", type=Path, default=None)
     parser.add_argument("--claude-bin", default="claude")
-    parser.add_argument("--timeout", type=int, default=3600, help="per session, seconds")
+    parser.add_argument(
+        "--timeout",
+        type=int,
+        default=runner_sessions.SESSION_TIMEOUT_SECONDS,
+        help="per session, seconds",
+    )
     parser.add_argument("--base-url", default=None)
     parser.add_argument(
         "--auth-token",
@@ -848,6 +866,8 @@ def main() -> int:
         parser.error("--generations must be positive")
     if args.runs < 1 or args.timeout < 1:
         parser.error("--runs and --timeout must be positive")
+    if args.workers < 1:
+        parser.error("--workers must be positive")
     try:
         args.model = runner.normalized_model_identifier(args.model)
         args.proposer_model = runner.normalized_model_identifier(
@@ -950,6 +970,10 @@ def main() -> int:
             if not record["ok"]:
                 print(f"[gen {generation}] proposer session failed: {record['error_detail']}")
                 return 1
+            print(
+                f"[gen {generation}] proposal ready in {record['duration_s']:.0f}s "
+                f"({record['num_turns']} turns, ${runner_sessions._na(record['cost_usd'])})"
+            )
             try:
                 candidate_overlay_files(overlay_dir)
                 resolve_incumbent_arms(overlay_dir, args.arms)
@@ -995,6 +1019,10 @@ def main() -> int:
             ),
             env=runner_environment(args),
             require_pid_namespace=True,
+            # The sweep is the multi-hour phase; without this its per-run
+            # progress lines only reach the log as a bounded tail, and only
+            # when it fails.
+            echo_stdout=True,
         )
         if not bench.ok:
             print(
