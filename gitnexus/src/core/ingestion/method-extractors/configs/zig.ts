@@ -1,0 +1,143 @@
+import { SupportedLanguages } from 'gitnexus-shared';
+import type { MethodExtractionConfig, ParameterInfo } from '../../method-types.js';
+import type { SyntaxNode } from '../../utils/ast-helpers.js';
+import { hasZigPubKeyword } from '../../export-detection.js';
+import { ZIG_CONTAINER_TYPES, zigContainerName } from '../../languages/zig/captures.js';
+
+/**
+ * Zig method extraction.
+ *
+ * tree-sitter-zig containers (struct/enum/union/opaque) are anonymous; the
+ * binding name lives on the parent variable_declaration, or on the enclosing
+ * generic type constructor (`fn List(comptime T: type) type { return struct
+ * {…}; }`) — `zigContainerName` decides. Methods inside a container appear as
+ * plain `function_declaration` children of the container node.
+ *
+ * The first parameter is the receiver iff it is named `self` (convention) —
+ * unlike Rust, Zig has no dedicated `self_parameter` node type.
+ */
+
+const extractZigOwnerName = (node: SyntaxNode, filePath?: string): string | undefined =>
+  zigContainerName(node, filePath);
+
+const extractZigName = (node: SyntaxNode): string | undefined => {
+  const nameNode = node.childForFieldName('name');
+  return nameNode?.text;
+};
+
+/**
+ * The `parameters` node of a function_declaration. tree-sitter-zig 1.1.2
+ * attaches it as a plain named child — NOT under a `parameters:` field (only
+ * `name`, `type` and `body` are fields), so a field lookup is always null
+ * (and the grammar-literal gate flags it as a dead field). Reading it that
+ * way silently produced empty parameter lists, no receiver, and
+ * `isStatic: true` for every method.
+ */
+const zigParameterList = (node: SyntaxNode): SyntaxNode | null =>
+  node.namedChildren.find((child): child is SyntaxNode => child?.type === 'parameters') ?? null;
+
+const extractZigReturnType = (node: SyntaxNode): string | undefined => {
+  // tree-sitter-zig labels the return type as the `type` field on
+  // function_declaration (the same field name used for parameter types).
+  const typeNode = node.childForFieldName('type');
+  return typeNode?.text?.trim();
+};
+
+/**
+ * Regular parameters only. A leading `self` parameter is the receiver — it is
+ * reported through `extractReceiverType`, not the parameter list (same split
+ * as Rust's `self_parameter` skip in `configs/rust.ts`).
+ */
+const extractZigParameters = (node: SyntaxNode): ParameterInfo[] => {
+  const paramList = zigParameterList(node);
+  if (!paramList) return [];
+  const params: ParameterInfo[] = [];
+  let seenParameter = false;
+  for (let i = 0; i < paramList.namedChildCount; i++) {
+    const param = paramList.namedChild(i);
+    if (!param || param.type !== 'parameter') continue;
+    const nameNode = param.childForFieldName('name');
+    const typeNode = param.childForFieldName('type');
+    const isReceiver = !seenParameter && nameNode?.text === 'self';
+    seenParameter = true;
+    if (isReceiver) continue;
+    params.push({
+      name: nameNode?.text ?? '?',
+      type: typeNode?.text?.trim() ?? null,
+      rawType: typeNode?.text?.trim() ?? null,
+      isOptional: false,
+      isVariadic: false,
+    });
+  }
+  return params;
+};
+
+const extractZigReceiverType = (node: SyntaxNode): string | undefined => {
+  const paramList = zigParameterList(node);
+  if (!paramList) return undefined;
+  const first = paramList.namedChild(0);
+  if (!first || first.type !== 'parameter') return undefined;
+  const nameNode = first.childForFieldName('name');
+  if (nameNode?.text !== 'self') return undefined;
+  const typeNode = first.childForFieldName('type');
+  return typeNode?.text?.trim();
+};
+
+/**
+ * Names a `test_declaration` during the enclosing-function walk (parse-worker
+ * `findEnclosingFunctionId`) with the SAME spelling ZIG_QUERIES captures as
+ * `@name` — the string node with its quotes — so calls inside `test "x" {}`
+ * attribute to the test's own Function node.
+ *
+ * Anonymous `test {}` and decl-tests `test add {}` are not graph nodes. They
+ * return `''`, not `null`: `null` falls through to `genericFuncName`, whose
+ * first-identifier scan would name `test add {}` "add" — the REAL `fn add`'s
+ * id — and hang the test body's calls on it. The empty name is falsy, so
+ * `findEnclosingFunctionId` skips this node WITHOUT attributing to it and
+ * keeps walking up; a test block can only sit at container level, so the walk
+ * reaches the file and the calls attribute to the File.
+ */
+const extractZigFunctionName = (
+  node: SyntaxNode,
+): { funcName: string | null; label: 'Function' } | null => {
+  if (node.type !== 'test_declaration') return null;
+  const nameString = node.namedChildren.find(
+    (child): child is SyntaxNode => child?.type === 'string',
+  );
+  return { funcName: nameString?.text ?? '', label: 'Function' };
+};
+
+export const zigMethodConfig: MethodExtractionConfig = {
+  language: SupportedLanguages.Zig,
+  // `source_file`: a file-struct's top-level fns are methods of the file's Struct.
+  typeDeclarationNodes: [...ZIG_CONTAINER_TYPES, 'source_file'],
+  methodNodeTypes: ['function_declaration'],
+  bodyNodeTypes: [],
+  extractOwnerName: extractZigOwnerName,
+  extractName: extractZigName,
+  extractFunctionName: extractZigFunctionName,
+  extractReturnType: extractZigReturnType,
+  extractParameters: extractZigParameters,
+  // `pub` only: `export fn` is C linkage, still private to other Zig files
+  // (isExported carries the FFI fact — see export-detection.ts).
+  extractVisibility: (node) => (hasZigPubKeyword(node) ? 'public' : 'private'),
+  extractReceiverType: extractZigReceiverType,
+
+  isStatic(node) {
+    // A Zig "method" is effectively static if its first parameter is not `self`.
+    const paramList = zigParameterList(node);
+    if (!paramList) return true;
+    const first = paramList.namedChild(0);
+    if (!first || first.type !== 'parameter') return true;
+    const nameNode = first.childForFieldName('name');
+    return nameNode?.text !== 'self';
+  },
+
+  isAbstract() {
+    return false;
+  },
+
+  isFinal() {
+    return false;
+  },
+};

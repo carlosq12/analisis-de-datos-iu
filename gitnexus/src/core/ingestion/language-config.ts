@@ -179,6 +179,41 @@ export interface SwiftPackageConfig {
   targets: Map<string, string>;
 }
 
+/** Zig package config parsed from build.zig.zon and the root build.zig */
+export interface ZigBuildZonConfig {
+  /**
+   * Map of dependency name -> the raw `.path = "..."` value, exactly as
+   * written in build.zig.zon (relative to the repo root, and possibly
+   * escaping it: `../local_dep`). Consumers normalize — see
+   * `normalizeZigDepPath` below, which rejects absolute
+   * and repo-escaping values. `.url`-based deps cannot be resolved to a
+   * repo-local file (they unpack into a build cache outside the repo) and so
+   * are not included here.
+   */
+  pathDeps: Map<string, string>;
+  /**
+   * Per path-dep: repo-relative root source files the dep's own `build.zig`
+   * declares (`b.addModule("name", .{ .root_source_file = b.path("src/x.zig")
+   * })`), keyed by dep name, in file order. Entries whose module name matches
+   * the dep name come first — that is the module a consumer's
+   * `@import("<dep>")` maps to under the ecosystem convention that the zon key
+   * and the module name agree. Absent (or empty) when the dep has no readable
+   * `build.zig`; the resolver then falls back to the conventional layouts.
+   */
+  moduleRoots?: Map<string, readonly string[]>;
+  /**
+   * Modules the repo's OWN root `build.zig` declares under an importable
+   * name, module name → repo-relative root source file
+   * (`b.addModule("lp", .{ .root_source_file = b.path("src/lp.zig") })`, or a
+   * `createModule` binding later named through `addImport("lp", binding)`).
+   * These are what an in-repo `@import("lp")` means — the most common shape in
+   * single-package repos, where every file imports the package's own root
+   * module by name. Independent of `build.zig.zon`: a repo with a `build.zig`
+   * and no zon still resolves them. See `parseZigRootModules`.
+   */
+  rootModules?: Map<string, string>;
+}
+
 // ============================================================================
 // LANGUAGE-SPECIFIC CONFIG LOADERS
 // ============================================================================
@@ -548,6 +583,469 @@ export async function loadSwiftPackageConfig(repoRoot: string): Promise<SwiftPac
   return null;
 }
 
+/**
+ * Load the Zig build configuration a repo's `build.zig.zon` + root `build.zig`
+ * declare: `.path` deps (and the roots their own build.zig names) from the
+ * zon, and the repo's own named modules from the root build.zig. Either file
+ * may be missing — a repo with a `build.zig` but no `build.zig.zon` still
+ * resolves `@import("<own module>")`. Null only when neither contributes.
+ *
+ * `build.zig.zon` is Zig source (an anonymous-struct literal), not JSON.
+ * Rather than pull in a tree-sitter parse for one file, we use a small
+ * regex-based extractor that handles the common shapes:
+ *
+ *   .dependencies = .{
+ *       .ziggit_pkg = .{
+ *           .url = "https://...",
+ *           .hash = "1220...",
+ *       },
+ *       .local_dep = .{
+ *           .path = "../local_dep",
+ *       },
+ *   },
+ *
+ * Limitations (intentional — bail to null on anything weirder):
+ *   - Only the top-level `.dependencies = .{ ... }` block is parsed (brace
+ *     depth 1); a same-named field nested in another struct is ignored.
+ *   - Each dep entry is matched by a single shape: `.<name> = .{ ... }`
+ *     where `<name>` is a bare identifier (no `@"…"` quoted form).
+ *   - Only `.path = "..."` is captured. `.url` deps are left unresolved
+ *     because their unpacked location lives outside the repo
+ *     (.zig-cache/p/<hash>/ or ~/.cache/zig/p/<hash>/) and is therefore
+ *     not in our `allFilePaths` set.
+ *   - `//` line comments are stripped before scanning (string-aware, so a
+ *     `//` inside `.url = "https://…"` survives), and brace matching skips
+ *     string literals — a commented-out `.path` or a `}` inside a comment
+ *     or string cannot declare a dep or truncate the block.
+ */
+export async function loadZigBuildConfig(repoRoot: string): Promise<ZigBuildZonConfig | null> {
+  let config: ZigBuildZonConfig | null = null;
+  try {
+    const raw = await fs.readFile(path.join(repoRoot, 'build.zig.zon'), 'utf-8');
+    config = parseZigBuildZon(raw);
+  } catch {
+    // No zon (or unreadable): the root build.zig may still declare modules.
+  }
+
+  // The repo's own importable modules, from its root build.zig. Independent
+  // of the zon: `@import("<own module>")` is how single-package repos refer
+  // to their root file from every other file.
+  let rootModules: Map<string, string> | undefined;
+  try {
+    const rootBuildZig = await fs.readFile(path.join(repoRoot, 'build.zig'), 'utf-8');
+    const parsed = parseZigRootModules(rootBuildZig);
+    if (parsed.size > 0) rootModules = parsed;
+  } catch {
+    // No root build.zig — nothing to declare.
+  }
+
+  if (config === null) {
+    return rootModules ? { pathDeps: new Map(), rootModules } : null;
+  }
+
+  // A path dep's importable root is whatever ITS build.zig declares, not a
+  // fixed layout: read `root_source_file` per `addModule` and remember it
+  // repo-relative. Best effort — an unreadable build.zig just leaves the
+  // conventional-layout fallback in place.
+  const moduleRoots = new Map<string, readonly string[]>();
+  for (const [depName, depPath] of config.pathDeps) {
+    const rel = normalizeZigDepPath(depPath);
+    if (rel === null) continue;
+    let buildZig: string;
+    try {
+      buildZig = await fs.readFile(path.join(repoRoot, rel, 'build.zig'), 'utf-8');
+    } catch {
+      continue;
+    }
+    const roots = parseZigBuildModuleRoots(buildZig, depName).map((r) =>
+      rel === '' ? r : `${rel}/${r}`,
+    );
+    if (roots.length > 0) moduleRoots.set(depName, roots);
+  }
+  return {
+    ...config,
+    ...(moduleRoots.size > 0 ? { moduleRoots } : {}),
+    ...(rootModules ? { rootModules } : {}),
+  };
+}
+
+/**
+ * Normalize a `.path` value from build.zig.zon into a repo-relative form.
+ * Returns null for paths that escape the repo root (start with `..`) or
+ * are absolute — those point to files we don't index. `.` / `./` normalize
+ * to the empty string (the repo root itself). Shared with the import
+ * resolver so both sides agree on which deps are in-repo.
+ */
+export function normalizeZigDepPath(depPath: string): string | null {
+  // Normalize separators BEFORE the absolute check so every Windows spelling
+  // is visible to it: POSIX (`/x`), drive (`C:\x`, `C:/x`), root-relative
+  // (`\x` → `/x`) and UNC (`\\server\share` → `//server/share`) paths all
+  // point outside the repository.
+  const normalized = depPath.replace(/\\/g, '/');
+  if (normalized.startsWith('/') || /^[A-Za-z]:\//.test(normalized)) return null;
+  const parts: string[] = [];
+  for (const part of normalized.split('/')) {
+    if (part === '' || part === '.') continue;
+    if (part === '..') {
+      if (parts.length === 0) return null;
+      parts.pop();
+    } else {
+      parts.push(part);
+    }
+  }
+  return parts.join('/');
+}
+
+/**
+ * The `root_source_file` paths a `build.zig` declares, dep-relative, with the
+ * module whose `addModule("<name>", …)` name equals `preferredName` first.
+ *
+ * Reads two shapes, which between them cover `zig init` output and the
+ * common hand-written build scripts:
+ *   - `b.addModule("name", .{ .root_source_file = b.path("src/root.zig") })`
+ *   - any other `.root_source_file = b.path("…")` (exe/lib/test artifacts),
+ *     kept as unnamed fallbacks in file order.
+ * A `.zig` under `b.path` is required — `.{ .cwd_relative = … }` and
+ * `LazyPath` values computed at build time are not resolvable statically and
+ * are skipped. Duplicates collapse to the first occurrence.
+ */
+export function parseZigBuildModuleRoots(buildZig: string, preferredName: string): string[] {
+  const named: string[] = [];
+  const unnamed: string[] = [];
+  const seen = new Set<string>();
+  const add = (into: string[], p: string): void => {
+    const norm = normalizeZigDepPath(p);
+    if (norm === null || norm === '' || !norm.endsWith('.zig') || seen.has(norm)) return;
+    seen.add(norm);
+    into.push(norm);
+  };
+  const rootRe = /\.root_source_file\s*=\s*b\.path\(\s*"([^"\n]+)"\s*\)/;
+  // The named module: scan the whole `addModule(…)` argument list, balanced
+  // on parentheses, so a nested field before `.root_source_file` (`.imports =
+  // &.{ .{ … } }`) does not end the match early — a `[^}]*` regex stopped at
+  // that inner `}` and silently demoted the module to an unnamed fallback.
+  const text = stripZonComments(buildZig);
+  const mask = zonStringMask(text);
+  const callRe = /\baddModule\s*\(/g;
+  let m: RegExpExecArray | null;
+  while ((m = callRe.exec(text)) !== null) {
+    if (mask[m.index] !== 0) continue;
+    const argsStart = m.index + m[0].length;
+    const argsEnd = findZigParenEnd(text, argsStart);
+    if (argsEnd < 0) break;
+    const args = text.slice(argsStart, argsEnd);
+    const nameMatch = /^\s*"([^"\n]+)"\s*,/.exec(args);
+    if (nameMatch?.[1] !== preferredName) continue;
+    const rootMatch = rootRe.exec(args);
+    if (rootMatch) add(named, rootMatch[1]!);
+  }
+  const anyRe = new RegExp(rootRe.source, 'g');
+  while ((m = anyRe.exec(text)) !== null) add(unnamed, m[1]!);
+  return [...named, ...unnamed];
+}
+
+/**
+ * The importable modules a repo's ROOT `build.zig` declares, module name →
+ * repo-relative root source file. Static scan (no execution) of two shapes:
+ *
+ *   - `b.addModule("<name>", .{ .root_source_file = b.path("<p>.zig"), … })`
+ *     names the module directly;
+ *   - `const m = b.createModule(.{ .root_source_file = b.path("<p>.zig"), … })`
+ *     (or `const m = b.addModule(…)`) bound to an identifier and later named
+ *     by `x.addImport("<name>", m)` or `.imports = &.{ .{ .name = "<name>",
+ *     .module = m } }`.
+ *
+ * Deliberately NOT resolved — they are not in-repo source files: modules whose
+ * root is not a static `b.path("….zig")` (generated `opts.createModule()` from
+ * `addOptions`, `translate_c.createModule()`, `.cwd_relative` / computed
+ * LazyPaths), `addImport("<name>", dep.module("…"))` (a `.url` / path dep,
+ * handled through the zon), and aliases whose module operand is anything but a
+ * bare identifier bound above (`config.lp_module`). Comments are stripped and
+ * string literals skipped; the first declaration of a name wins.
+ */
+export function parseZigRootModules(buildZig: string): Map<string, string> {
+  const text = stripZonComments(buildZig);
+  const mask = zonStringMask(text);
+  const modules = new Map<string, string>();
+  // identifier → repo-relative root, for `const m = b.createModule(…)` /
+  // `const m = b.addModule(…)` bindings later named via addImport.
+  const bindings = new Map<string, string>();
+  const rootRe = /\.root_source_file\s*=\s*b\.path\(\s*"([^"\n]+)"\s*\)/;
+  const bindingRe = /(?:const|var)\s+([A-Za-z_]\w*)\s*=\s*(?:[A-Za-z_]\w*\.)*$/;
+  const callRe = /\b(addModule|createModule)\s*\(/g;
+  let m: RegExpExecArray | null;
+  while ((m = callRe.exec(text)) !== null) {
+    if (mask[m.index] !== 0) continue;
+    const argsStart = m.index + m[0].length;
+    const argsEnd = findZigParenEnd(text, argsStart);
+    if (argsEnd < 0) break;
+    const args = text.slice(argsStart, argsEnd);
+    const rootMatch = rootRe.exec(args);
+    const root = rootMatch ? normalizeZigDepPath(rootMatch[1]!) : null;
+    if (root === null || root === '' || !root.endsWith('.zig')) continue;
+    if (m[1] === 'addModule') {
+      const nameMatch = /^\s*"([^"\n]+)"\s*,/.exec(args);
+      if (nameMatch && !modules.has(nameMatch[1]!)) modules.set(nameMatch[1]!, root);
+    }
+    const binding = bindingRe.exec(text.slice(0, m.index));
+    if (binding && !bindings.has(binding[1]!)) bindings.set(binding[1]!, root);
+  }
+  if (bindings.size === 0) return modules;
+  const aliasRes = [
+    /\.addImport\(\s*"([^"\n]+)"\s*,\s*([A-Za-z_]\w*)\s*\)/g,
+    /\.name\s*=\s*"([^"\n]+)"\s*,\s*\.module\s*=\s*([A-Za-z_]\w*)\s*[,}]/g,
+  ];
+  for (const re of aliasRes) {
+    while ((m = re.exec(text)) !== null) {
+      if (mask[m.index] !== 0) continue;
+      const root = bindings.get(m[2]!);
+      if (root !== undefined && !modules.has(m[1]!)) modules.set(m[1]!, root);
+    }
+  }
+  return modules;
+}
+
+/**
+ * Index of the `)` matching the `(` that precedes `start`, skipping parens
+ * inside `"…"` literals. -1 when unbalanced. Call on comment-stripped text.
+ */
+function findZigParenEnd(text: string, start: number): number {
+  let depth = 1;
+  let inString = false;
+  for (let i = start; i < text.length; i++) {
+    const ch = text[i];
+    if (inString) {
+      if (ch === '\\') i++;
+      else if (ch === '"') inString = false;
+      continue;
+    }
+    if (ch === '"') inString = true;
+    else if (ch === '(') depth++;
+    else if (ch === ')' && --depth === 0) return i;
+  }
+  return -1;
+}
+
+/**
+ * Blank out `//` line comments (and `\\` multiline-string-literal lines) in
+ * ZON source, string-aware: a `//` inside a `"…"` literal (`.url =
+ * "https://…"`) is content, not a comment. Comment bytes are replaced with
+ * spaces so every surviving character keeps its offset.
+ */
+function stripZonComments(raw: string): string {
+  const out = raw.split('');
+  let inString = false;
+  for (let i = 0; i < raw.length; i++) {
+    const ch = raw[i];
+    if (inString) {
+      if (ch === '\\')
+        i++; // skip the escaped char
+      else if (ch === '"') inString = false;
+      continue;
+    }
+    if (ch === '"') {
+      inString = true;
+      continue;
+    }
+    const isLineComment = ch === '/' && raw[i + 1] === '/';
+    const isMultilineLiteral =
+      ch === '\\' &&
+      raw[i + 1] === '\\' &&
+      /^[ \t]*$/.test(raw.slice(raw.lastIndexOf('\n', i) + 1, i));
+    if (isLineComment || isMultilineLiteral) {
+      while (i < raw.length && raw[i] !== '\n') out[i++] = ' ';
+    }
+  }
+  return out.join('');
+}
+
+/**
+ * Index of the `}` matching the `{` that precedes `start`, skipping braces
+ * inside `"…"` literals. -1 when unbalanced. Call on comment-stripped text.
+ */
+function findZonBlockEnd(text: string, start: number): number {
+  let depth = 1;
+  let inString = false;
+  for (let i = start; i < text.length; i++) {
+    const ch = text[i];
+    if (inString) {
+      if (ch === '\\') i++;
+      else if (ch === '"') inString = false;
+      continue;
+    }
+    if (ch === '"') inString = true;
+    else if (ch === '{') depth++;
+    else if (ch === '}' && --depth === 0) return i;
+  }
+  return -1;
+}
+
+/**
+ * `body` with every nested `{ … }` block (string-aware) replaced by spaces of
+ * equal length, so a regex over the result only sees the block's DIRECT
+ * fields and offsets still line up with the original text.
+ */
+function zonBlankNestedBlocks(body: string): string {
+  const out = body.split('');
+  let depth = 0;
+  let inString = false;
+  for (let i = 0; i < body.length; i++) {
+    const ch = body[i];
+    if (inString) {
+      if (ch === '\\') {
+        if (depth > 0 && i + 1 < body.length) out[i + 1] = ' ';
+        i++;
+      } else if (ch === '"') inString = false;
+      if (depth > 0) out[i] = ' ';
+      continue;
+    }
+    if (ch === '"') inString = true;
+    else if (ch === '{') depth++;
+    else if (ch === '}' && depth > 0) {
+      depth--;
+      out[i] = ' ';
+      continue;
+    }
+    if (depth > 0) out[i] = ' ';
+  }
+  return out.join('');
+}
+
+/**
+ * Per-offset "is inside a `"…"` literal" mask for comment-stripped ZON text,
+ * so header regexes can reject a match that merely LOOKS like a field
+ * (`.name = ".dependencies = .{ … }"` is a string, not the dependencies
+ * block). Escaped quotes (`\"`) do not end the literal.
+ */
+function zonStringMask(text: string): Uint8Array {
+  const mask = new Uint8Array(text.length);
+  let inString = false;
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i];
+    if (inString) {
+      mask[i] = 1;
+      if (ch === '\\' && i + 1 < text.length) mask[++i] = 1;
+      else if (ch === '"') inString = false;
+      continue;
+    }
+    if (ch === '"') {
+      inString = true;
+      mask[i] = 1;
+    }
+  }
+  return mask;
+}
+
+/**
+ * Per-offset brace depth for comment-stripped ZON text, string-aware: the
+ * depth AT an offset is the number of unclosed `{` before it. The file's
+ * top-level `.{` puts every direct field at depth 1.
+ */
+function zonDepthMask(text: string): Uint8Array {
+  const depth = new Uint8Array(text.length);
+  let d = 0;
+  let inString = false;
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i];
+    depth[i] = d;
+    if (inString) {
+      if (ch === '\\' && i + 1 < text.length) depth[++i] = d;
+      else if (ch === '"') inString = false;
+      continue;
+    }
+    if (ch === '"') inString = true;
+    else if (ch === '{') d++;
+    else if (ch === '}' && d > 0) d--;
+  }
+  return depth;
+}
+
+/**
+ * First match of a sticky-free global `re` in `text[from, to)` whose start
+ * lies outside a string literal (per `mask`) and, when `depthAt` is given, at
+ * exactly that brace depth (per `depth`). Null when none.
+ */
+function matchZonHeader(
+  text: string,
+  re: RegExp,
+  mask: Uint8Array,
+  from: number,
+  to: number,
+  depth?: Uint8Array,
+  depthAt?: number,
+): RegExpExecArray | null {
+  re.lastIndex = from;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(text)) !== null && m.index < to) {
+    if (mask[m.index] !== 0) continue;
+    if (depth !== undefined && depthAt !== undefined && depth[m.index] !== depthAt) continue;
+    return m;
+  }
+  return null;
+}
+
+/** Pure parser split out for testability. Returns null when no path-deps found. */
+export function parseZigBuildZon(raw: string): ZigBuildZonConfig | null {
+  const text = stripZonComments(raw);
+  const mask = zonStringMask(text);
+  const depth = zonDepthMask(text);
+  // Locate the `.dependencies = .{ ... }` block. Use brace counting because
+  // dep entries are nested anonymous structs and a naive `}` match would stop
+  // early — and only accept a header outside string literals AND at brace
+  // depth 1 (a direct field of the file's top-level `.{`), so neither a
+  // `.name` value spelling `.dependencies = .{` nor a `.dependencies` field
+  // nested in some earlier anonymous struct can hijack it.
+  const depsHeader = matchZonHeader(
+    text,
+    /\.dependencies\s*=\s*\.\{/g,
+    mask,
+    0,
+    text.length,
+    depth,
+    1,
+  );
+  if (!depsHeader) return null;
+  const start = depsHeader.index + depsHeader[0].length;
+  const end = findZonBlockEnd(text, start);
+  if (end < 0) return null;
+
+  const pathDeps = new Map<string, string>();
+  // Walk each `.<name> = .{ ... }` entry inside [start, end); the body ends
+  // at the matching brace (string-aware), not at the first `}` in the text,
+  // and an entry header inside a string (`.url = "…/.x = .{"`) is not an entry.
+  const entryHeaderRe = /\.([A-Za-z_][A-Za-z0-9_]*)\s*=\s*\.\{/g;
+  let cursor = start;
+  let m: RegExpExecArray | null;
+  while ((m = matchZonHeader(text, entryHeaderRe, mask, cursor, end)) !== null) {
+    const depName = m[1];
+    const bodyStart = m.index + m[0].length;
+    const bodyEnd = findZonBlockEnd(text, bodyStart);
+    if (bodyEnd < 0 || bodyEnd > end) break;
+    cursor = bodyEnd + 1;
+    // Only a `.path` that is a DIRECT field of the entry counts: a nested
+    // object inside the entry (`.foo = .{ .url = "…", .x = .{ .path = "…" } }`)
+    // must not turn a URL dep into a path dep. Blank nested blocks first and
+    // reject a match that starts inside a string literal.
+    const body = zonBlankNestedBlocks(text.slice(bodyStart, bodyEnd));
+    const pathMatch = matchZonHeader(
+      body,
+      /\.path\s*=\s*"([^"\n]+)"/g,
+      mask.subarray(bodyStart, bodyEnd),
+      0,
+      body.length,
+    );
+    if (pathMatch) {
+      pathDeps.set(depName, pathMatch[1]);
+    }
+  }
+
+  if (pathDeps.size === 0) return null;
+  if (isDev) {
+    logger.info(`📦 Loaded ${pathDeps.size} Zig path-dep(s) from build.zig.zon`);
+  }
+  return { pathDeps };
+}
+
 // ============================================================================
 // BUNDLED CONFIG LOADER
 // ============================================================================
@@ -571,6 +1069,9 @@ export interface ImportConfigs {
   csharpConfigs: CSharpProjectConfig[];
   /** In-repo namespace evidence gating C# suffix-fallback resolution (#1881). */
   csharpNamespaces?: CSharpNamespaceEvidence;
+  /** Zig `.path` deps from build.zig.zon. Optional so call sites that
+   *  hand-build ImportConfigs (tests) don't have to supply it. */
+  zigBuildZon?: ZigBuildZonConfig | null;
 }
 
 /** Load all language-specific configs once for an ingestion run. */
@@ -583,5 +1084,6 @@ export async function loadImportConfigs(repoRoot: string): Promise<ImportConfigs
     swiftPackageConfig: await loadSwiftPackageConfig(repoRoot),
     csharpConfigs: csharpScan.configs,
     csharpNamespaces: csharpScanToEvidence(csharpScan),
+    zigBuildZon: await loadZigBuildConfig(repoRoot),
   };
 }
