@@ -95,6 +95,7 @@ import {
   isSupportedCjkSegmentationMode,
   MAX_CJK_SEGMENTATION_QUERY_LENGTH,
 } from '../../core/search/cjk-segmentation.js';
+import { contentRetentionFromMeta } from '../../core/content-retention.js';
 import {
   checkStalenessAsync,
   checkCwdMatch,
@@ -165,6 +166,29 @@ const VALUE_CANDIDATE_TYPES: ReadonlySet<string> = new Set(['Const', 'Variable',
  * only truncation signal available when the COUNT leg fails.
  */
 const CANDIDATE_WINDOW = 20;
+
+/**
+ * `content` is an index capability rather than a promise that every symbol has
+ * text. Retention `none` intentionally omits it, while `symbol` retains only
+ * symbol spans. Keep this response additive and emit it only when requested so
+ * callers relying on the legacy response shape remain compatible.
+ */
+const requestedContentAvailability = (
+  requested: boolean,
+  meta: Awaited<ReturnType<typeof loadMeta>>,
+) => {
+  if (!requested) return undefined;
+  const profile = contentRetentionFromMeta(meta);
+  return {
+    requested: true as const,
+    profile,
+    available: profile !== 'none',
+    scope: profile,
+    ...(profile === 'none'
+      ? { reason: 'Source-derived content is not retained by this index.' }
+      : {}),
+  };
+};
 
 /**
  * The pieces every ambiguous-resolution payload shares, derived once.
@@ -342,6 +366,8 @@ export const VALID_NODE_LABELS = new Set([
   'Folder',
   'Function',
   'Class',
+  'Protocol',
+  'Category',
   'Interface',
   'Method',
   'CodeElement',
@@ -2568,7 +2594,16 @@ export class LocalBackend {
 
     const processLimit = params.limit || 5;
     const maxSymbolsPerProcess = params.max_symbols || 10;
-    const includeContent = params.include_content ?? false;
+    const requestedContent = params.include_content ?? false;
+    // Do not trust a lingering graph property when the metadata contract says
+    // source-derived text is unavailable. A full rebuild normally removes the
+    // column values; this guard keeps a partially migrated/corrupt index from
+    // disclosing text merely because a caller asked for it. `query` already
+    // reads this metadata for CJK and embedding-dimension drift diagnostics,
+    // so keep that legacy read unconditional.
+    const meta = await loadMeta(path.dirname(repo.lbugPath));
+    const includeContent = requestedContent && contentRetentionFromMeta(meta) !== 'none';
+    const contentAvailability = requestedContentAvailability(requestedContent, meta);
     const searchQuery = rawQuery.trim();
 
     // Per-phase timing instrumentation (#553). Records wall time for each
@@ -2971,7 +3006,6 @@ export class LocalBackend {
     // GITNEXUS_FTS_CJK_SEGMENTATION (the only thing that actually throws in
     // there) cannot take an unrelated diagnostic down with it. Needs no guard
     // of its own: loadMeta() returns null on any read/parse failure.
-    const meta = await loadMeta(path.dirname(repo.lbugPath));
     try {
       // meta.json is on-disk state inside the analyzed repo, read via a
       // schema-less JSON.parse — not trusted input. Validate before
@@ -3065,6 +3099,7 @@ export class LocalBackend {
       process_symbols: dedupedSymbols,
       definitions: definitions.slice(0, 20), // cap standalone definitions
       timing,
+      ...(contentAvailability ? { contentAvailability } : {}),
       ...(warnings.length > 0 && { warning: warnings.join(' ') }),
       ...((enrichmentDegraded || ftsPartial) && { partial: true }),
     };
@@ -4054,6 +4089,12 @@ export class LocalBackend {
     await this.ensureInitialized(repo);
 
     const { name, uid, file_path, kind, include_content } = params;
+    const requestedContent = include_content ?? false;
+    // Content retention matters only to the opt-in content response. Avoid a
+    // metadata dependency for the long-standing default context operation.
+    const meta = requestedContent ? await loadMeta(path.dirname(repo.lbugPath)) : null;
+    const contentAvailability = requestedContentAvailability(requestedContent, meta);
+    const includeContent = requestedContent && contentRetentionFromMeta(meta) !== 'none';
 
     if (!name && !uid) {
       return { error: 'Either "name" or "uid" parameter is required.' };
@@ -4061,7 +4102,7 @@ export class LocalBackend {
 
     const outcome = await this.resolveSymbolCandidates(
       repo,
-      { uid, name, include_content },
+      { uid, name, include_content: includeContent },
       { file_path, kind },
     );
 
@@ -4108,7 +4149,7 @@ export class LocalBackend {
         repo.lbugPath,
         `
       MATCH (caller)-[r:CodeRelation]->(n {id: $symId})
-      WHERE r.type IN ['CALLS', 'IMPORTS', 'EXTENDS', 'IMPLEMENTS', 'USES', 'HAS_METHOD', 'HAS_PROPERTY', 'METHOD_OVERRIDES', 'OVERRIDES', 'METHOD_IMPLEMENTS', 'ACCESSES']
+      WHERE r.type IN ['CALLS', 'IMPORTS', 'EXTENDS', 'IMPLEMENTS', 'USES', 'DECLARES', 'HAS_METHOD', 'HAS_PROPERTY', 'METHOD_OVERRIDES', 'OVERRIDES', 'METHOD_IMPLEMENTS', 'ACCESSES']
       RETURN r.type AS relType, caller.id AS uid, caller.name AS name, caller.filePath AS filePath, labels(caller)[0] AS kind
       ORDER BY uid, relType
       LIMIT 30
@@ -4263,7 +4304,7 @@ export class LocalBackend {
         repo.lbugPath,
         `
       MATCH (n {id: $symId})-[r:CodeRelation]->(target)
-      WHERE r.type IN ['CALLS', 'IMPORTS', 'EXTENDS', 'IMPLEMENTS', 'USES', 'HAS_METHOD', 'HAS_PROPERTY', 'METHOD_OVERRIDES', 'OVERRIDES', 'METHOD_IMPLEMENTS', 'ACCESSES']
+      WHERE r.type IN ['CALLS', 'IMPORTS', 'EXTENDS', 'IMPLEMENTS', 'USES', 'DECLARES', 'HAS_METHOD', 'HAS_PROPERTY', 'METHOD_OVERRIDES', 'OVERRIDES', 'METHOD_IMPLEMENTS', 'ACCESSES']
       RETURN r.type AS relType, target.id AS uid, target.name AS name, target.filePath AS filePath, labels(target)[0] AS kind
       ORDER BY uid, relType
       LIMIT 30
@@ -4442,6 +4483,7 @@ export class LocalBackend {
 
     return {
       status: 'found',
+      ...(contentAvailability ? { contentAvailability } : {}),
       symbol: {
         uid: sym.id || sym[0],
         name: sym.name || sym[1],
@@ -4449,7 +4491,7 @@ export class LocalBackend {
         filePath: sym.filePath || sym[3],
         startLine: toDisplayLine(sym.startLine ?? sym[4]),
         endLine: toDisplayLine(sym.endLine ?? sym[5]),
-        ...(include_content && (sym.content || sym[6]) ? { content: sym.content || sym[6] } : {}),
+        ...(includeContent && (sym.content || sym[6]) ? { content: sym.content || sym[6] } : {}),
         ...(methodMetadata ? { methodMetadata } : {}),
         ...(beanMetadata ? { bean: beanMetadata } : {}),
         ...(aopMetadata ? { aop: aopMetadata } : {}),

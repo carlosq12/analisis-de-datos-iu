@@ -218,6 +218,7 @@ describe('PARSE_CACHE_VERSION', () => {
   // the pre-fix fan-out. This branch staged 64 above the claims live at the
   // time (61, 62, 63); all three landed and cascaded main to 67, so 68 is the
   // next free value above every claim at merge — the rule, re-applied.
+  // Version 69 also exists on the fork for Objective-C semantic graph facts.
   // Version 69 added #2969's JS/TS data-route-table decoratorRoutes. Version 70
   // adds Spring non-HTTP handler side-channel facts (#2417 / #2891), so it is
   // the next free value after both cache payload changes.
@@ -240,14 +241,18 @@ describe('PARSE_CACHE_VERSION', () => {
   // collided, because each re-checked once and neither re-checked after the
   // other moved — which is why the rule is re-applied AT MERGE, not when the
   // number is picked.
-  it('pins SCHEMA_BUMP to 77 so concurrent bumps cannot silently collide (#2766)', () => {
-    expect(Number(PARSE_CACHE_VERSION.split('+', 1)[0])).toBe(77);
+  // Version 78 merges upstream's v77 payload with the fork's Objective-C
+  // semantic graph side-channel, so warm caches from either parent miss.
+  it('pins SCHEMA_BUMP to 78 so concurrent bumps cannot silently collide (#2766)', () => {
+    expect(Number(PARSE_CACHE_VERSION.split('+', 1)[0])).toBe(78);
     // The PREVIOUS version must fail the reuse gate, not merely differ from the
     // current one — a hardcoded number outside the conflict hunk rebases cleanly
     // while being wrong, which is exactly how the 37/38 exact clashes landed.
     // Every nearby historical or in-flight value is rejected, including 69,
     // which carried the route-table payload before this merge.
-    for (const taken of [59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75, 76]) {
+    for (const taken of [
+      59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75, 76, 77,
+    ]) {
       expect(Number(PARSE_CACHE_VERSION.split('+', 1)[0])).not.toBe(taken);
     }
   });

@@ -534,6 +534,11 @@ import type { ParseWorkerResult } from '../core/ingestion/workers/parse-worker.j
 // stale 2), which is the rule above: above every claim, not above origin/main.
 // RE-CHECK AGAINST origin/main IMMEDIATELY BEFORE MERGING.
 //
+// 68 -> 69 for Objective-C semantic graph extraction plus the objective-c
+// ParsedFile side-channel carrying provider facts. A warm v68 cache would replay
+// `.m`/`.mm`/classified `.h` chunks without Class/Protocol/Category/Method
+// nodes, unresolved-message evidence, or post-resolution ObjC call facts.
+//
 // 68 -> 69 added #2969's JS/TS data-route-table decoratorRoutes. A warm v68
 // cache would replay unchanged worker results without those routes. Version 70
 // then adds Spring non-HTTP handler side-channel facts (#2417 / #2891), so Java
@@ -650,7 +655,12 @@ import type { ParseWorkerResult } from '../core/ingestion/workers/parse-worker.j
 // `route-extractors/` and `workers/` module content — would close the missing-
 // bump axis without invalidating on unrelated churn, and is the real follow-up.
 // RE-CHECK AGAINST origin/main AND OPEN PRs IMMEDIATELY BEFORE MERGING.
-const SCHEMA_BUMP = 77;
+//
+// 77 -> 78 merges the fork Objective-C semantic graph side-channel with
+// upstream's v77 cache payload. A warm cache from either parent must miss:
+// v69 lacks upstream route/Convex/object-literal captures, and v77 lacks the
+// Objective-C provider-owned graph facts.
+const SCHEMA_BUMP = 78;
 const GITNEXUS_PKG_VERSION = (() => {
   try {
     // package.json sits at gitnexus/package.json — two levels up from
