@@ -45,6 +45,14 @@ program
   .option('-f, --force', 'Apply the changes (default is a dry-run preview)')
   .action(createLazyAction(() => import('./uninstall.js'), 'uninstallCommand'));
 
+program
+  .command('watch [action]')
+  .description(
+    'Control scheduled repository clone/pull and analysis from GITNEXUS_HOME/watch_config.yml',
+  )
+  .addHelpText('after', () => t('help.watch.details'))
+  .action(createLazyAction(() => import('./watch.js'), 'watchCommand'));
+
 // Baseline of GITNEXUS_EMBEDDING_DIMS captured by the analyze preAction hook
 // before it overwrites the var, so the postAction hook can restore it. The
 // analyzeCommand env snapshot is taken AFTER this hook runs, so it cannot undo

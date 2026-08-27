@@ -132,6 +132,10 @@ export const en = {
     'One-time setup: configure MCP for Cursor, Claude Code, Antigravity, OpenCode, CodeBuddy, Qoder, Codex',
   'help.command.uninstall.description':
     'Reverse `setup`: remove GitNexus MCP entries, skills, and hooks from all detected editors',
+  'help.command.watch.description':
+    'Control scheduled repository clone/pull and analysis from GITNEXUS_HOME/watch_config.yml',
+  'help.watch.details':
+    '\nActions: init, start (default), restart, stop, status, reset\nConfiguration: GITNEXUS_HOME/watch_config.yml\nRuntime files: GITNEXUS_HOME/watch/watch.pid, watch.mutex, watch.owner.json, watch.status.json, auto-sync-state.json\nRecovery: mutexes with verified dead owners are reclaimed automatically; invalid or legacy mutexes fail closed and require manual removal after confirming no watch process is running.\nWrites: GITNEXUS_HOME/watch/project_commit_info.txt\nRemote URLs: only SSH URLs on github.com, gitlab.com, and gitee.com are allowed.\nRuns once immediately, then repeats on sync_interval_minutes.',
   'help.command.analyze.description': 'Index a repository (full analysis)',
   'help.command.index.description':
     'Register an existing .gitnexus/ folder into the global registry (no re-analysis needed)',

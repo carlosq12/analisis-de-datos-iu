@@ -757,11 +757,10 @@ export const readRegistryStrict = async (): Promise<RegistryEntry[]> => readRegi
  * registry is the one file every gitnexus process on the machine writes, and
  * `withRegistryLock` degrades to unlocked on timeout, so the write cannot rely
  * on the lock to keep two writers off one staging path (#2888).
- *
- * `attempts` is forwarded to the rename retry; best-effort callers pass `1`.
  */
 const writeRegistry = async (entries: RegistryEntry[], attempts?: number): Promise<void> => {
-  await fs.mkdir(getGlobalDir(), { recursive: true });
+  const dir = getGlobalDir();
+  await fs.mkdir(dir, { recursive: true });
   await writeFileAtomic(
     getGlobalRegistryPath(),
     JSON.stringify(sanitizeEntries(entries), null, 2),
@@ -1545,12 +1544,7 @@ export const listRegisteredRepos = async (opts?: {
     try {
       await withRegistryLock(async () => {
         const fresh = await readRegistry();
-        // attempts: 1 — the catch below discards a failure, so the rename
-        // backoff would only make every other process wait out this lock.
-        await writeRegistry(
-          fresh.filter((entry) => !pruned.has(entry.path)),
-          1,
-        );
+        await writeRegistry(fresh.filter((entry) => !pruned.has(entry.path)), 1);
       });
     } catch (err) {
       // Best-effort housekeeping: callers consume the returned view, and the
