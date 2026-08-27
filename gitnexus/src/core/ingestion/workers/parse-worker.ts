@@ -82,6 +82,11 @@ let C: TreeSitterLanguage | null = null;
 try {
   C = requireVendoredGrammar('tree-sitter-c') as TreeSitterLanguage;
 } catch {}
+
+let Lua: TreeSitterLanguage | null = null;
+try {
+  Lua = requireVendoredGrammar('tree-sitter-lua') as TreeSitterLanguage;
+} catch {}
 import { getLanguageFromFilename } from 'gitnexus-shared';
 import {
   buildDefinitionPreScan,
@@ -555,6 +560,7 @@ const languageMap: Record<string, TreeSitterLanguage> = {
   [SupportedLanguages.Vue]: TypeScript.typescript,
   ...(Dart ? { [SupportedLanguages.Dart]: Dart } : {}),
   ...(Swift ? { [SupportedLanguages.Swift]: Swift } : {}),
+  ...(Lua ? { [SupportedLanguages.Lua]: Lua } : {}),
 };
 
 /**

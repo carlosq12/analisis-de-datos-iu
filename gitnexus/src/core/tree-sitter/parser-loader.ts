@@ -177,6 +177,17 @@ const SOURCES: Record<string, GrammarSource> = {
       'Likely cause: no prebuilt `.node` for this platform/architecture. ' +
       `See ${ISSUES_URL}/2107.`,
   },
+  [SupportedLanguages.Lua]: {
+    load: () => requireVendoredGrammar('tree-sitter-lua'),
+    optional: true,
+    userSkippable: true,
+    unavailableNote:
+      'Lua parsing disabled: vendored `tree-sitter-lua` (under ' +
+      '`gitnexus/vendor/tree-sitter-lua`) failed to load. ' +
+      'Likely cause: the native binding did not build at install (missing ' +
+      'python3/make/clang) or no prebuilt `.node` for this platform/architecture. ' +
+      `See ${ISSUES_URL}.`,
+  },
 };
 
 /**
@@ -206,7 +217,7 @@ const loadCache = new Map<string, LoadResult>();
 const logged = new Set<string>();
 
 /**
- * Runtime opt-out for genuinely-optional grammars (Swift/Dart/Kotlin).
+ * Runtime opt-out for genuinely-optional grammars (Swift/Dart/Kotlin/Lua).
  *
  * `GITNEXUS_SKIP_OPTIONAL_GRAMMARS` has historically been an *install-time*
  * env only — the postinstall build scripts read it to skip building the
@@ -220,7 +231,7 @@ const logged = new Set<string>();
  * Accepts `1` / `true` / `all` / `*` (every skippable grammar), or a
  * comma-separated list of language ids and/or package names
  * (e.g. `swift,tree-sitter-dart`). Only grammars flagged `userSkippable` (the
- * genuinely-optional swift/dart/kotlin) can be skipped — required dependencies
+ * genuinely-optional swift/dart/kotlin/lua) can be skipped — required dependencies
  * routed through the optional machinery for ABI safety (C) carry no
  * `userSkippable` and are never skippable here.
  */
